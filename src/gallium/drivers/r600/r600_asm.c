@@ -43,7 +43,7 @@ static inline bool alu_writes(struct r600_bytecode_alu *alu)
 	return alu->dst.write || alu->is_op3;
 }
 
-static inline unsigned int r600_bytecode_get_num_operands(struct r600_bytecode_alu *alu)
+static inline unsigned int r600_bytecode_get_num_operands(const struct r600_bytecode_alu *alu)
 {
 	return r600_isa_alu(alu->op)->src_count;
 }
@@ -402,7 +402,8 @@ static int reserve_gpr(struct alu_bank_swizzle *bs, unsigned sel, unsigned chan,
 	return 0;
 }
 
-static int reserve_cfile(struct r600_bytecode *bc, struct alu_bank_swizzle *bs, unsigned sel, unsigned chan)
+static int reserve_cfile(const struct r600_bytecode *bc, struct alu_bank_swizzle *bs,
+			 unsigned sel, unsigned chan)
 {
 	int res, num_res = 4;
 	if (bc->chip_class >= R700) {
@@ -444,7 +445,7 @@ static int is_const(int sel)
 		sel <= V_SQ_ALU_SRC_LITERAL);
 }
 
-static int check_vector(struct r600_bytecode *bc, struct r600_bytecode_alu *alu,
+static int check_vector(const struct r600_bytecode *bc, const struct r600_bytecode_alu *alu,
 			struct alu_bank_swizzle *bs, int bank_swizzle)
 {
 	int r, src, num_src, sel, elem, cycle;
@@ -474,7 +475,7 @@ static int check_vector(struct r600_bytecode *bc, struct r600_bytecode_alu *alu,
 	return 0;
 }
 
-static int check_scalar(struct r600_bytecode *bc, struct r600_bytecode_alu *alu,
+static int check_scalar(const struct r600_bytecode *bc, const struct r600_bytecode_alu *alu,
 			struct alu_bank_swizzle *bs, int bank_swizzle)
 {
 	int r, src, num_src, const_count, sel, elem, cycle;
@@ -520,6 +521,239 @@ static int check_scalar(struct r600_bytecode *bc, struct r600_bytecode_alu *alu,
 	return 0;
 }
 
+enum {
+/* SRC0_TO_CYCLE0 = SQ_ALU_VEC_210+1. Values are made explicit to ease
+ * understanding arithmetic behind their calculation in a code */
+	SRC0_TO_CYCLE0 = 6,
+	SRC0_TO_CYCLE1 = 7,
+	SRC0_TO_CYCLE2 = 8,
+	SRC1_TO_CYCLE0 = 9,
+	SRC1_TO_CYCLE1 = 10,
+	SRC1_TO_CYCLE2 = 11,
+	SRC2_TO_CYCLE0 = 12,
+	SRC2_TO_CYCLE1 = 13,
+	SRC2_TO_CYCLE2 = 14,
+	SWIZZLE_UNSET  = 15
+};
+
+struct i_slot_n_src {
+	unsigned char slot, src;
+};
+
+struct src_node {
+	struct i_slot_n_src orig_index;
+	struct src_node *conflict[4*3];
+	int lastconflict; /* -1 is unset, but after interference_graph() it's always a valid index */
+	/* struct i_slot_n_src[] opt_adj_cycle; */
+	/* struct i_slot_n_src[] opt_same_cycle; */
+};
+
+// todo: 1) separate slot vs single unsigned? 2) ugly code with struct
+// assignment inside the "same slot conflict"
+
+static inline void set_conflict(struct src_node* n1, struct src_node* n2) {
+	n1->lastconflict++;
+	n2->lastconflict++;
+	n1->conflict[n1->lastconflict] = n2;
+	n2->conflict[n2->lastconflict] = n1;
+}
+
+static inline unsigned src_sel(struct r600_bytecode_alu* slots[], const struct i_slot_n_src* i)
+{
+	return slots[i->slot]->src[i->src].sel;
+}
+
+static inline unsigned src_chan(struct r600_bytecode_alu* slots[], const struct i_slot_n_src* i)
+{
+	return slots[i->slot]->src[i->src].chan;
+}
+
+#define FOREACH_SLOT_N_SRC(name, start_slot, node_index, start_node)	\
+	struct i_slot_n_src name;					\
+	unsigned node_index = start_node;				\
+	for (name.slot = start_slot; name.slot < nslots; name.slot++)	\
+		for (name.src = 0;					\
+		     name.src < r600_bytecode_get_num_operands(slots[name.slot]); \
+		     name.src++, node_index++)
+
+/* Assumptions: size of node_arr must be the sum of existing operands of every enabled slot; and
+ * srcs in node_arr must have increasing order starting from 0 slot */
+static void interference_graph(struct r600_bytecode_alu *slots[], unsigned nslots,
+			       struct src_node* node_arr[], unsigned* distinct_cfiles)
+{
+	// todo: refactoring idea — fill array with pointers to original operands before this function
+	*distinct_cfiles = 0; //todo: same chans but distinct regs
+	FOREACH_SLOT_N_SRC(curr_src, 0, icurr_src, 0) {
+// todo: maybe the optimization when srcn==srcn+1 reduces conflicts too? Dunno.
+		if (curr_src.src == 0) /* same slot srcs trivially can't use same cycle */
+			for (int i = 1; i < r600_bytecode_get_num_operands(slots[curr_src.slot]); i++)
+				set_conflict(node_arr[icurr_src], node_arr[icurr_src+i]);
+		node_arr[icurr_src]->orig_index = curr_src;
+		if (!is_gpr(src_sel(slots, &curr_src))) {
+			if (is_cfile(src_sel(slots, &curr_src)))
+				(*distinct_cfiles)++;
+			continue;
+		}
+		unsigned inxt_src0 = icurr_src +
+			r600_bytecode_get_num_operands(slots[curr_src.slot]) - curr_src.src;
+		FOREACH_SLOT_N_SRC(nxt_src, curr_src.slot+1, inxt_src, inxt_src0) {
+			if (is_gpr(src_sel(slots, &nxt_src)) &&
+			    src_chan(slots, &nxt_src) == src_chan(slots, &curr_src) &&
+			    src_sel(slots, &nxt_src) != src_sel(slots, &curr_src))
+				set_conflict(node_arr[icurr_src], node_arr[inxt_src]);
+		}
+	}
+	//todo trans unit
+}
+
+#undef FOREACH_SLOT_N_SRC
+
+static inline void combine_cycle(unsigned src, unsigned *bank_swizzle, unsigned cycle_i,
+				 unsigned n_enabled_srcs) {
+	if (n_enabled_srcs == 1) { /* choice for the other 2 doesn't matter */
+		*bank_swizzle = (cycle_i == 0)? SQ_ALU_VEC_012
+			: (cycle_i == 1)? SQ_ALU_VEC_102
+			: SQ_ALU_VEC_201;
+		return;
+	}
+	assert(src >= 0 && src <= 2 && *bank_swizzle <= SWIZZLE_UNSET);
+	if (*bank_swizzle == SWIZZLE_UNSET) {
+		*bank_swizzle = (src == 0)? SRC0_TO_CYCLE0 + cycle_i
+			: (src == 1)? SRC1_TO_CYCLE0 + cycle_i
+			: SRC2_TO_CYCLE0 + cycle_i;
+	} else if (*bank_swizzle >= SRC0_TO_CYCLE0) {
+		unsigned old_src = *bank_swizzle / 3 - 2, /* C discards fractional part */
+			old_cycle = *bank_swizzle % 3;
+		assert(src != old_src && cycle_i != old_cycle);
+		unsigned missing_src = 3 - (src + old_src),
+			missing_cycle = 3 - (cycle_i + old_cycle);
+		assert(cycle_i != old_cycle && src != old_src);
+		char cycles[3];
+		cycles[cycle_i] = src;
+		cycles[old_cycle] = old_src;
+		cycles[missing_cycle] = missing_src;
+		if (cycles[0] == 0)
+			*bank_swizzle = (cycles[1] == 1)? SQ_ALU_VEC_012 : SQ_ALU_VEC_021;
+		else if (cycles[0] == 1)
+			*bank_swizzle = (cycles[1] == 0)? SQ_ALU_VEC_102 : SQ_ALU_VEC_120;
+		else
+			*bank_swizzle = (cycles[1] == 0)? SQ_ALU_VEC_201 : SQ_ALU_VEC_210;
+	} /* skip SQ_ALU_VEC_* range because 3-rd cycle is inferred on the 2-nd assignment */
+}
+
+static inline char taken_cycle(unsigned nsrc, unsigned bank_swizzle) {
+	assert(bank_swizzle <= SWIZZLE_UNSET);
+	if (bank_swizzle == SWIZZLE_UNSET) {
+		return 0;
+	} else if (bank_swizzle <= SQ_ALU_VEC_210) {
+		switch(bank_swizzle) {
+		case SQ_ALU_VEC_012:
+			return 1 << (2 - nsrc);
+		case SQ_ALU_VEC_201:
+			return 1 << (2 - (nsrc + 1) % 3);
+		case SQ_ALU_VEC_120:
+			return 1 << (2 - (nsrc + 2) % 3);
+		case SQ_ALU_VEC_210:
+			return 1 << nsrc;
+		case SQ_ALU_VEC_102:
+			return 1 << ((nsrc + 1) % 3);
+		case SQ_ALU_VEC_021:
+			return 1 << ((nsrc + 2) % 3);
+		}
+		return 0; /* to satisfy a compiler */
+	} else { /* one of SRC*_TO_CYCLE* */
+		return 1 << (bank_swizzle % 3);
+	}
+}
+
+static bool assign_cycle(const struct src_node *node, struct r600_bytecode_alu **slots) {
+	char cycles = 0; /* array of free (0) cycles in order […],0,1,2 */
+	for (int i = 0; i <= node->lastconflict; i++)
+		cycles |= taken_cycle(node->conflict[i]->orig_index.src,
+				      slots[node->orig_index.slot]->bank_swizzle);
+	if (cycles == 7) /* 00000111b */
+		return false;
+	unsigned cycle_i = ((cycles & 1) == 0) ? 0 // todo: optimization hint
+		: ((cycles & (1 << 1)) == 0)   ? 1
+		: 2;
+	combine_cycle(node->orig_index.src, &slots[node->orig_index.slot]->bank_swizzle, cycle_i,
+		      r600_bytecode_get_num_operands(slots[node->orig_index.slot]));
+	return true;
+}
+
+static void sort_conflicts_more_first(struct src_node* nodes[], unsigned nnodes)
+{
+	for(int fwd = 0; fwd < nnodes; fwd++)
+		for(int back = fwd; back >= 1; back--)
+			if (nodes[back-1]->lastconflict < nodes[back]->lastconflict) {
+				struct src_node* tmp = nodes[back];
+				nodes[back] = nodes[back-1];
+				nodes[back-1] = tmp;
+			} else
+				break;
+}
+
+static inline int check_vec_swizzles(struct src_node *nodes[], unsigned nnodes,
+				     struct r600_bytecode_alu *slots[])
+{
+	nnodes--;
+	for (; nnodes > 0; nnodes--)
+		if (slots[nodes[nnodes]->orig_index.slot]->bank_swizzle > SQ_ALU_VEC_210) {
+			fprintf(stderr, "Geez, unassigned swizzle. What ya gonna do?\n");
+			return -1;
+		}
+	return 0;
+}
+
+static inline void init_nodes(struct src_node nodes_storage[], struct src_node *nodes[],
+			      unsigned n_slots_n_srcs){
+	for (int n = 0; n < n_slots_n_srcs; n++) {
+		nodes[n] = &nodes_storage[n];
+		nodes_storage[n].lastconflict = -1;
+	}
+}
+
+static int schedule_bank_swizzle(struct r600_bytecode_alu *slots_unpacked[5])
+{
+	unsigned distinct_cfiles = 0;
+	struct r600_bytecode_alu *slots[4];
+	unsigned nslots = 0; // todo?
+	for (int s = 0; s < 4; s++)
+		if (slots_unpacked[s]) {
+			slots[nslots] = slots_unpacked[s];
+			nslots++;
+		}
+	assert(nslots);
+	unsigned n_slots_n_srcs = 0, nforced = 0;
+	for (int sl = 0; sl < nslots; sl++) {
+		n_slots_n_srcs += r600_bytecode_get_num_operands(slots[sl]);
+		if (!slots[sl]->bank_swizzle_force) /* SQ_ALU_VEC_012 means "unset" */
+			slots[sl]->bank_swizzle = SWIZZLE_UNSET;
+		else {
+			slots[sl]->bank_swizzle = slots[sl]->bank_swizzle_force;
+			nforced++;
+		}
+	}
+	if (nforced == n_slots_n_srcs)
+		return 0;
+	struct src_node nodes_storage[n_slots_n_srcs];
+	struct src_node *nodes[n_slots_n_srcs];
+	init_nodes(nodes_storage, nodes, n_slots_n_srcs);
+	interference_graph(slots, nslots, nodes, &distinct_cfiles);
+	if (distinct_cfiles % 2 || distinct_cfiles > 4) {
+		fprintf(stderr, "Holy graal, more than 4 cfiles! Stop it, please!\n"); // todo
+		return -1;
+	}
+
+	sort_conflicts_more_first(nodes, n_slots_n_srcs);
+	for (int n = 0; n < n_slots_n_srcs; n++) {
+		if (!assign_cycle(nodes[n], slots))
+			return -1;
+	}
+	return check_vec_swizzles(nodes, nslots, slots);
+	//return 0;
+}
+
 static int check_and_set_bank_swizzle(struct r600_bytecode *bc,
 				      struct r600_bytecode_alu *slots[5])
 {
@@ -528,6 +762,8 @@ static int check_and_set_bank_swizzle(struct r600_bytecode *bc,
 	int i, r = 0, forced = 1;
 	boolean scalar_only = bc->chip_class == CAYMAN ? false : true;
 	int max_slots = bc->chip_class == CAYMAN ? 4 : 5;
+	if (!slots[4]) // todo: I didn't implement transendental unit yet
+		return schedule_bank_swizzle(slots);
 
 	for (i = 0; i < max_slots; i++) {
 		if (slots[i]) {
